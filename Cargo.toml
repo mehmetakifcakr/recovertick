@@ -1,0 +1,32 @@
+[package]
+name = "recovertick"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Allocation-free deterministic state transitions with bounded recovery and verified replay"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["embedded", "no-std", "state-machine", "recovery", "replay"]
+categories = ["embedded", "no-std", "simulation"]
+include = ["src/**", "examples/**", "tests/**", "benches/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE-*", "CHANGELOG.md"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[[bench]]
+name = "dispatch"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "warn"
+

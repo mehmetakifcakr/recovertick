@@ -1,0 +1,182 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Test jobs receive read-only credentials; only the release job can write.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Official actions are pinned to full commits; Dependabot proposes updates.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install stable with lint tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Reject Clippy warnings
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+        include:
+          - os: ubuntu-latest
+            rust: "1.85.1"
+    env:
+      TEST_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install selected toolchain
+        run: rustup toolchain install "$TEST_TOOLCHAIN" --profile minimal
+      - name: Test debug targets
+        run: cargo +"$TEST_TOOLCHAIN" test --all-targets --all-features --locked
+      - name: Test release targets
+        run: cargo +"$TEST_TOOLCHAIN" test --release --all-targets --all-features --locked
+      # --all-targets does not include doctests, so they have a dedicated step.
+      - name: Test documentation examples
+        run: cargo +"$TEST_TOOLCHAIN" test --doc --all-features --locked
+      - name: Build documentation without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +"$TEST_TOOLCHAIN" doc --no-deps --all-features --locked
+
+  embedded:
+    name: no_std Cortex-M build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install MSRV embedded target
+        run: rustup toolchain install 1.85.1 --profile minimal --target thumbv7em-none-eabihf
+      - name: Check library without a host standard library
+        run: cargo +1.85.1 check --lib --target thumbv7em-none-eabihf --locked
+
+  package:
+    name: Verify distributable package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Validate package identity and metadata
+        run: python3 scripts/release_check.py --expected-name recovertick
+      - name: Package and build the packaged source
+        run: cargo +stable package --locked --allow-dirty
+      - name: Run publication checks without uploading
+        run: cargo +stable publish --dry-run --locked --allow-dirty --registry crates-io
+
+  release:
+    name: Publish tagged version
+    # A tag runs the full matrix first. Manual dispatch can never publish.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, test, embedded, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag against Cargo version
+        id: identity
+        run: >-
+          python3 scripts/release_check.py
+          --expected-name recovertick --tag "$RELEASE_TAG"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Require tag to point to current remote main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          main_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$tag_commit" != "$main_commit" ]]; then
+            echo "Release tag must point to the current origin/main commit." >&2
+            exit 1
+          fi
+      - name: Install stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Build release archive
+        run: cargo +stable package --locked
+      - name: Detect a completed publication on a retry
+        id: registry
+        env:
+          PACKAGE_NAME: ${{ steps.identity.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.identity.outputs.version }}
+        run: >-
+          python3 scripts/release_check.py
+          --expected-name recovertick --tag "$RELEASE_TAG"
+          --archive "target/package/$PACKAGE_NAME-$PACKAGE_VERSION.crate"
+          --check-registry --github-output "$GITHUB_OUTPUT"
+      - name: Publish to crates.io
+        if: steps.registry.outputs.already_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "Set the repository secret CARGO_REGISTRY_TOKEN before releasing." >&2
+            exit 1
+          fi
+          cargo +stable publish --locked --registry crates-io
+      - name: Create checksum and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: ${{ steps.identity.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd target/package
+          archive="$PACKAGE_NAME-$PACKAGE_VERSION.crate"
+          sha256sum "$archive" > "$archive.sha256"
+          # Recover from a successful crates.io upload followed by a GitHub failure.
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$archive" "$archive.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$archive" "$archive.sha256" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --title "$PACKAGE_NAME $RELEASE_TAG"
+          fi
