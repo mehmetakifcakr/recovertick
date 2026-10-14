@@ -4,21 +4,10 @@ use std::cell::Cell;
 use std::future::{pending, ready, Future};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use recovertick::demo::{Motor, MotorEffect, MotorEvent, MotorFault, MotorState};
 use recovertick::{Command, DispatchError, Engine, Outcome, Policy, Transition};
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
-}
 
 fn motor<const N: usize>() -> Engine<Motor, N> {
     Engine::new(
@@ -54,8 +43,7 @@ fn cancelling_a_pending_input_preserves_the_complete_engine() {
         .unwrap();
     let before = engine.snapshot();
     let records: Vec<_> = engine.journal().iter().copied().collect();
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
 
     let mut operation = Box::pin(engine.dispatch_async(pending::<Command<MotorEvent>>()));
     assert!(matches!(
@@ -97,8 +85,7 @@ fn a_ready_input_commits_in_the_same_poll_without_another_await() {
         command: Command::event(1, MotorEvent::Start),
         polls: Rc::clone(&polls),
     };
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut operation = Box::pin(engine.dispatch_async(source));
 
     let record = match operation.as_mut().poll(&mut context) {
@@ -122,8 +109,7 @@ fn ready_input_propagates_dispatch_error_without_mutation() {
         .unwrap();
     let before = engine.snapshot();
     let records: Vec<_> = engine.journal().iter().copied().collect();
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut operation = Box::pin(engine.dispatch_async(ready(Command::event(6, MotorEvent::Stop))));
 
     assert_eq!(
@@ -149,8 +135,7 @@ fn async_backpressure_propagates_trace_full_without_committing_input() {
         .dispatch(Command::event(1, MotorEvent::Start))
         .unwrap();
     let before = engine.snapshot();
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut operation = Box::pin(engine.dispatch_async(ready(Command::event(2, MotorEvent::Stop))));
 
     assert_eq!(
@@ -166,8 +151,7 @@ fn async_backpressure_propagates_trace_full_without_committing_input() {
 #[test]
 fn an_application_fault_is_an_accepted_async_decision() {
     let mut engine = motor::<4>();
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut operation = Box::pin(engine.dispatch_async(ready(Command::event(
         1,
         MotorEvent::StartWhen { ready_at: 4 },
